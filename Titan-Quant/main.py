@@ -1,74 +1,86 @@
 import time
 import json
 import os
+import sys
 from core.data_engine import DataEngine
 from core.strategy_engine import StrategyEngine
-from core.ai_guardian import AIGuardian
 from core.storage import Storage
 from core.notifier import Notifier
 
+# 路径
 ROOT = os.path.dirname(os.path.abspath(__file__))
-
-def load_json(path):
-    with open(path, 'r') as f: return json.load(f)
+CONFIG_FILE = os.path.join(ROOT, 'config', 'config.json')
+SECRETS_FILE = os.path.join(ROOT, 'config', 'secrets.json')
+DB_FILE = os.path.join(ROOT, 'data', 'titan.db')
+STATUS_FILE = os.path.join(ROOT, 'data', 'status.json')
 
 def main():
-    print("🚀 Titan-Quant Ultra (AI-Agent) 启动中...")
+    print("🚀 Titan-Quant Pro 正在启动...")
     
-    config = load_json(os.path.join(ROOT, 'config/config.json'))
-    secrets = load_json(os.path.join(ROOT, 'config/secrets.json'))
+    # 初始化
+    storage = Storage(DB_FILE)
     
-    storage = Storage(os.path.join(ROOT, 'data/titan.db'))
-    notifier = Notifier(config['system']['webhook_url'])
-    
-    ai_agent = None
-    if config['strategy']['use_ai_filter']:
-        ai_agent = AIGuardian(secrets['deepseek']['apiKey'], secrets['deepseek']['model'])
-        print("🤖 DeepSeek 风险官已就位")
-
-    engines = {}
-    for name, ex_conf in config['exchanges'].items():
-        engines[name] = DataEngine(name, ex_conf, secrets['exchanges'][name])
-
     while True:
         try:
-            config = load_json(os.path.join(ROOT, 'config/config.json'))
+            # 1. 读取配置 (支持热更新)
+            with open(CONFIG_FILE, 'r') as f: config = json.load(f)
+            with open(SECRETS_FILE, 'r') as f: secrets = json.load(f)
+            
+            # 通知模块
+            notifier = Notifier(config['system']['webhook_url'])
+
+            # 检查开关
             if not config['system']['is_running']:
+                print("💤 机器人暂停中... (请在前端开启)")
+                time.sleep(5)
+                continue
+                
+            # 检查 Key
+            if not secrets['apiKey']:
+                print("⚠️ 未配置 API Key (请在前端配置)")
                 time.sleep(5)
                 continue
 
-            for name, engine in engines.items():
-                symbol = config['exchanges'][name]['symbol']
-                df = engine.fetch_ohlcv(symbol, config['strategy']['timeframe'])
-                if df is None: continue
-                
-                tech_res = StrategyEngine.analyze(df, config['strategy'])
-                status_msg = f"[{name}] 扫描: {tech_res['reason']}"
-                
-                if tech_res['signal']:
-                    print(f"🔔 {name} 技术信号: {tech_res['signal']}")
-                    
-                    if ai_agent:
-                        print("🤖 AI 正在审计...")
-                        ai_res = ai_agent.review_signal(df, tech_res)
-                        if ai_res['approved']:
-                            print(f"✅ AI 通过! 评分: {ai_res['score']}")
-                            notifier.send(f"开单 ({name})", f"AI评分: {ai_res['score']}\n{ai_res['reason']}")
-                            storage.log_trade(name, symbol, tech_res['signal'], tech_res['entry_price'], 0, ai_res['reason'], ai_res['score'])
-                        else:
-                            print(f"🛑 AI 驳回: {ai_res['reason']}")
-                            status_msg = f"AI 驳回: {ai_res['reason']}"
-                    else:
-                        print("✅ 无AI模式，执行开单")
-                        storage.log_trade(name, symbol, tech_res['signal'], tech_res['entry_price'], 0, tech_res['reason'])
+            # 初始化数据引擎
+            data_eng = DataEngine(secrets['apiKey'], secrets['secret'])
+            strat_conf = config['strategy']
+            symbol = strat_conf['symbol']
 
-                with open(os.path.join(ROOT, 'data/status.json'), 'w') as f:
-                    json.dump({"last_log": status_msg}, f)
+            # 2. 获取数据
+            df = data_eng.fetch_data(symbol, strat_conf['timeframe'])
+            balance = data_eng.get_balance()
+            
+            # 3. 分析策略
+            res = StrategyEngine.analyze(df, strat_conf)
+            
+            # 4. 更新前端状态
+            status = {
+                "price": res['indicators']['price'],
+                "adx": res['indicators']['adx'],
+                "signal": res['signal'],
+                "reason": res['reason'],
+                "balance": balance,
+                "position": "检测中..." # 这里可以扩展读取真实持仓
+            }
+            with open(STATUS_FILE, 'w') as f:
+                json.dump(status, f)
+
+            # 5. 执行逻辑 (这里为了安全，先打印 Log，实盘时取消注释 execute)
+            if res['signal']:
+                msg = f"🔔 信号触发: {res['signal']} @ {res['entry_price']}\n理由: {res['reason']}"
+                print(msg)
+                notifier.send("信号触发", msg)
+                
+                # TODO: 在这里调用 execution_engine 下单
+                # exec_eng.place_order(...) 
+                # storage.log_trade(...)
+
+            print(f"[{time.strftime('%H:%M:%S')}] 扫描完成. ADX={res['indicators']['adx']:.1f}")
+            time.sleep(config['system']['check_interval'])
 
         except Exception as e:
-            print(f"❌ 错误: {e}")
-        
-        time.sleep(config['system']['check_interval'])
+            print(f"❌ 主循环错误: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()

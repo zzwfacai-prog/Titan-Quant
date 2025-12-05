@@ -4,27 +4,15 @@
         "check_interval": 60,
         "webhook_url": ""
     },
-    "exchanges": {
-        "binance_main": {
-            "type": "ccxt",
-            "id": "binanceusdm",
-            "symbol": "BTC/USDT"
-        },
-        "asterdex_01": {
-            "type": "custom",
-            "api_url": "https://api.asterdex.com/v1",
-            "symbol": "BTC/USDT"
-        }
-    },
     "strategy": {
-        "name": "v5.5 High-Freq + AI",
+        "name": "v5.5 High-Freq Aggressive",
+        "symbol": "BTC/USDT",
         "timeframe": "1h",
         "leverage": 20,
         "risk_per_trade": 0.018,
         "adx_threshold": 15,
         "sl_atr_mult": 2.0,
         "tp_atr_mult": 8.0,
-        "min_notional": 110,
-        "use_ai_filter": true
+        "min_notional": 110
     }
 }

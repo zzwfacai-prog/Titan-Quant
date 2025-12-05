@@ -8,6 +8,8 @@ class Notifier:
 
     def send(self, title, content):
         if not self.url: return
+        
+        # 适配钉钉机器人
         data = {
             "msgtype": "markdown",
             "markdown": {
