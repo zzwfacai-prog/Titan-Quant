@@ -1,130 +1,139 @@
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+from core.base_strategy import BaseStrategy
 
 class BacktestEngine:
-    def __init__(self, initial_balance=10000, commission=0.0005):
-        self.initial_balance = initial_balance
-        self.commission = commission
-        self.balance = initial_balance
-        self.positions = []
-        self.trades = []
+    def __init__(self, initial_capital=10000, commission=0.0005):
+        self.initial_capital = initial_capital
+        self.commission = commission  # 手续费率 (默认万5)
+        self.reset()
+
+    def reset(self):
+        self.balance = self.initial_capital
         self.equity_curve = []
+        self.trades = []
+        self.position = None  # None, 'LONG', 'SHORT'
+        self.entry_price = 0
+        self.sl = 0
+        self.tp = 0
+        self.trade_log = []
 
-    def run(self, df, strategy_class, params):
-        # 1. 初始化策略
-        strategy = strategy_class(params)
+    def run(self, df: pd.DataFrame, strategy: BaseStrategy):
+        self.reset()
+        # 1. 预计算指标
+        df = strategy.add_indicators(df.copy())
         
-        # 2. 计算指标 (一次性计算以加速)
-        df = df.copy()
-        strategy.add_indicators(df)
-        
-        # 3. 逐K线模拟
-        in_position = False
-        entry_price = 0
-        direction = None
-        sl = 0
-        tp = 0
-        
-        for i in range(50, len(df)): # 前50根用于指标预热
-            curr_bar = df.iloc[i]
+        # 2. 逐K线回测 (Bar-by-Bar)
+        # 从第50根开始，给指标留出预热期
+        for i in range(50, len(df)):
+            current_bar = df.iloc[i]
             prev_bar = df.iloc[i-1]
-            current_idx = df.index[i]
+            timestamp = current_bar['time']
+            close_price = current_bar['close']
             
-            # 记录资金曲线
-            self.equity_curve.append({'time': curr_bar['time'], 'balance': self.balance})
+            # --- 记录权益 ---
+            unrealized_pnl = 0
+            if self.position == 'LONG':
+                unrealized_pnl = (close_price - self.entry_price) / self.entry_price * self.balance
+            elif self.position == 'SHORT':
+                unrealized_pnl = (self.entry_price - close_price) / self.entry_price * self.balance
+            
+            self.equity_curve.append({
+                'time': timestamp,
+                'equity': self.balance + unrealized_pnl,
+                'price': close_price
+            })
 
-            # --- 平仓逻辑 (止盈止损) ---
-            if in_position:
+            # --- 平仓逻辑 (止盈/止损) ---
+            if self.position:
+                exit_price = None
                 pnl = 0
-                close_signal = False
-                exit_price = curr_bar['close'] # 简化：以收盘价结算
+                reason = ""
                 
-                # 检查止损止盈
-                if direction == 'LONG':
-                    if curr_bar['low'] <= sl: 
-                        exit_price = sl
-                        close_signal = True
-                        reason = "SL"
-                    elif curr_bar['high'] >= tp:
-                        exit_price = tp
-                        close_signal = True
-                        reason = "TP"
-                elif direction == 'SHORT':
-                    if curr_bar['high'] >= sl:
-                        exit_price = sl
-                        close_signal = True
-                        reason = "SL"
-                    elif curr_bar['low'] <= tp:
-                        exit_price = tp
-                        close_signal = True
-                        reason = "TP"
-
-                if close_signal:
-                    # 计算盈亏
-                    if direction == 'LONG':
-                        pnl = (exit_price - entry_price) / entry_price * self.balance
-                    else:
-                        pnl = (entry_price - exit_price) / entry_price * self.balance
+                # 检查是否触发 SL/TP (使用 High/Low 模拟盘中触达)
+                if self.position == 'LONG':
+                    if current_bar['low'] <= self.sl:
+                        exit_price = self.sl
+                        reason = "Stop Loss"
+                    elif current_bar['high'] >= self.tp:
+                        exit_price = self.tp
+                        reason = "Take Profit"
+                elif self.position == 'SHORT':
+                    if current_bar['high'] >= self.sl:
+                        exit_price = self.sl
+                        reason = "Stop Loss"
+                    elif current_bar['low'] <= self.tp:
+                        exit_price = self.tp
+                        reason = "Take Profit"
+                
+                # 执行平仓
+                if exit_price:
+                    # 计算盈亏 (扣除双边手续费)
+                    trade_pnl_pct = (exit_price - self.entry_price) / self.entry_price if self.position == 'LONG' else (self.entry_price - exit_price) / self.entry_price
+                    fee_cost = self.commission * 2
+                    realized_pnl = self.balance * (trade_pnl_pct - fee_cost)
                     
-                    # 扣除手续费 (开+平)
-                    fee = self.balance * self.commission * 2
-                    pnl -= fee
-                    
-                    self.balance += pnl
+                    self.balance += realized_pnl
                     self.trades.append({
-                        'entry_time': entry_time,
-                        'exit_time': curr_bar['time'],
-                        'side': direction,
-                        'entry_price': entry_price,
+                        'entry_time': self.entry_time,
+                        'exit_time': timestamp,
+                        'side': self.position,
+                        'entry_price': self.entry_price,
                         'exit_price': exit_price,
-                        'pnl': pnl,
-                        'pnl_pct': pnl / (self.balance - pnl),
+                        'pnl': realized_pnl,
+                        'pnl_pct': trade_pnl_pct * 100,
                         'reason': reason
                     })
-                    in_position = False
-                    direction = None
+                    self.position = None
 
-            # --- 开单逻辑 ---
-            if not in_position:
-                # 传入当前切片数据给策略
-                # 注意：为了防未来函数，这里应该非常小心，简化起见我们传入截止当前的df
-                # 实际策略中通常取 iloc[-1]
-                temp_df = df.iloc[:i+1]
-                res = strategy.on_bar(temp_df)
+            # --- 开仓逻辑 ---
+            if self.position is None:
+                # 调用策略获取信号
+                signal_data = strategy.on_bar(df, i)
                 
-                if res and res['signal']:
-                    direction = res['signal']
-                    entry_price = curr_bar['close']
-                    sl = res['stop_loss']
-                    tp = res['take_profit']
-                    entry_time = curr_bar['time']
-                    in_position = True
+                if signal_data['signal'] in ['LONG', 'SHORT']:
+                    self.position = signal_data['signal']
+                    self.entry_price = close_price
+                    self.entry_time = timestamp
+                    self.sl = signal_data['stop_loss']
+                    self.tp = signal_data['take_profit']
         
-        return self.generate_report()
+        return self._generate_report()
 
-    def generate_report(self):
-        if not self.trades:
-            return {"error": "无交易产生"}
-            
-        df_trades = pd.DataFrame(self.trades)
-        wins = df_trades[df_trades['pnl'] > 0]
-        losses = df_trades[df_trades['pnl'] <= 0]
+    def _generate_report(self):
+        trades_df = pd.DataFrame(self.trades)
+        equity_df = pd.DataFrame(self.equity_curve)
         
-        total_trades = len(df_trades)
+        if trades_df.empty:
+            return {"error": "无交易产生", "equity": equity_df, "trades": trades_df}
+
+        # 核心指标计算
+        total_trades = len(trades_df)
+        wins = trades_df[trades_df['pnl'] > 0]
+        losses = trades_df[trades_df['pnl'] <= 0]
         win_rate = len(wins) / total_trades * 100
         
         avg_win = wins['pnl'].mean() if not wins.empty else 0
-        avg_loss = abs(losses['pnl'].mean()) if not losses.empty else 0
-        wl_ratio = avg_win / avg_loss if avg_loss != 0 else 0
+        avg_loss = abs(losses['pnl'].mean()) if not losses.empty else 1
+        profit_factor = avg_win / avg_loss
         
-        max_drawdown = 0 # 需单独计算，此处简化
+        total_return = (self.balance - self.initial_capital) / self.initial_capital * 100
         
+        # 最大回撤计算
+        equity_series = equity_df['equity']
+        rolling_max = equity_series.cummax()
+        drawdown = (equity_series - rolling_max) / rolling_max
+        max_drawdown = drawdown.min() * 100
+
         return {
-            "total_trades": total_trades,
+            "initial_capital": self.initial_capital,
             "final_balance": self.balance,
-            "total_pnl": self.balance - self.initial_balance,
+            "total_return": total_return,
+            "total_trades": total_trades,
             "win_rate": win_rate,
-            "wl_ratio": wl_ratio,
-            "trades": df_trades,
-            "equity": pd.DataFrame(self.equity_curve)
+            "profit_factor": profit_factor,
+            "max_drawdown": max_drawdown,
+            "trades": trades_df,
+            "equity": equity_df
         }
