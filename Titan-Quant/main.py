@@ -1,74 +1,118 @@
 import time
 import json
 import os
+import logging
 from core.data_engine import DataEngine
 from core.strategy_engine import StrategyEngine
+from core.command_bridge import CommandBridge
 from core.ai_guardian import AIGuardian
-from core.storage import Storage
-from core.notifier import Notifier
 
+# 路径配置
 ROOT = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(ROOT, 'logs', 'bot.log')
+CONFIG_FILE = os.path.join(ROOT, 'config', 'config.json')
+SECRETS_FILE = os.path.join(ROOT, 'config', 'secrets.json')
+STATUS_FILE = os.path.join(ROOT, 'data', 'status.json')
+
+# 确保目录存在
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+
+# 日志配置
+logging.basicConfig(
+    filename=LOG_FILE, 
+    level=logging.INFO, 
+    format='%(asctime)s - %(message)s',
+    encoding='utf-8'
+)
 
 def load_json(path):
-    with open(path, 'r') as f: return json.load(f)
+    with open(path, 'r', encoding='utf-8') as f: return json.load(f)
 
 def main():
-    print("🚀 Titan-Quant Ultra (AI-Agent) 启动中...")
+    print("🚀 Titan-Quant Core Started.")
+    logging.info("System Initialized")
     
-    config = load_json(os.path.join(ROOT, 'config/config.json'))
-    secrets = load_json(os.path.join(ROOT, 'config/secrets.json'))
-    
-    storage = Storage(os.path.join(ROOT, 'data/titan.db'))
-    notifier = Notifier(config['system']['webhook_url'])
-    
-    ai_agent = None
-    if config['strategy']['use_ai_filter']:
-        ai_agent = AIGuardian(secrets['deepseek']['apiKey'], secrets['deepseek']['model'])
-        print("🤖 DeepSeek 风险官已就位")
-
-    engines = {}
-    for name, ex_conf in config['exchanges'].items():
-        engines[name] = DataEngine(name, ex_conf, secrets['exchanges'][name])
-
     while True:
         try:
-            config = load_json(os.path.join(ROOT, 'config/config.json'))
+            # 1. 实时读取配置
+            config = load_json(CONFIG_FILE)
+            secrets = load_json(SECRETS_FILE)
+            
+            # 2. 响应前端指令
+            cmd = CommandBridge.read_command()
+            if cmd:
+                print(f"⚡ 收到指令: {cmd['command']}")
+                logging.info(f"Command: {cmd['command']}")
+                # 实例化引擎处理平仓指令
+                temp_eng = DataEngine('cmd', config['exchanges']['binance_main'], secrets['exchanges']['binance_main'])
+                if cmd['command'] == "CLOSE_ALL":
+                    msg = temp_eng.close_all(config['strategy']['symbol'])
+                    logging.info(msg)
+
+            # 3. 检查开关
             if not config['system']['is_running']:
-                time.sleep(5)
+                time.sleep(2)
                 continue
 
-            for name, engine in engines.items():
-                symbol = config['exchanges'][name]['symbol']
-                df = engine.fetch_ohlcv(symbol, config['strategy']['timeframe'])
-                if df is None: continue
+            # 4. 执行策略
+            ex_conf = config['exchanges']['binance_main']
+            ex_sec = secrets['exchanges']['binance_main']
+            symbol = config['strategy']['symbol']
+            
+            engine = DataEngine('binance', ex_conf, ex_sec)
+            df = engine.fetch_ohlcv(symbol, config['strategy']['timeframe'])
+            
+            if df is None:
+                print("获取行情失败...")
+                time.sleep(5)
+                continue
                 
-                tech_res = StrategyEngine.analyze(df, config['strategy'])
-                status_msg = f"[{name}] 扫描: {tech_res['reason']}"
+            res = StrategyEngine.analyze(df, config['strategy'])
+            
+            # 5. 更新状态文件
+            status_data = {
+                "price": res['indicators']['price'],
+                "adx": res['indicators']['adx'],
+                "signal": res['signal'],
+                "reason": res['reason'],
+                "balance": "API未配"
+            }
+            try:
+                if ex_sec['apiKey']:
+                    bal = engine.client.fetch_balance()['USDT']['free']
+                    status_data['balance'] = round(bal, 2)
+            except:
+                pass
                 
-                if tech_res['signal']:
-                    print(f"🔔 {name} 技术信号: {tech_res['signal']}")
-                    
-                    if ai_agent:
-                        print("🤖 AI 正在审计...")
-                        ai_res = ai_agent.review_signal(df, tech_res)
-                        if ai_res['approved']:
-                            print(f"✅ AI 通过! 评分: {ai_res['score']}")
-                            notifier.send(f"开单 ({name})", f"AI评分: {ai_res['score']}\n{ai_res['reason']}")
-                            storage.log_trade(name, symbol, tech_res['signal'], tech_res['entry_price'], 0, ai_res['reason'], ai_res['score'])
-                        else:
-                            print(f"🛑 AI 驳回: {ai_res['reason']}")
-                            status_msg = f"AI 驳回: {ai_res['reason']}"
-                    else:
-                        print("✅ 无AI模式，执行开单")
-                        storage.log_trade(name, symbol, tech_res['signal'], tech_res['entry_price'], 0, tech_res['reason'])
+            with open(STATUS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(status_data, f)
+            
+            print(f"扫描完成: ADX={res['indicators']['adx']:.1f} | 信号: {res['signal']}")
 
-                with open(os.path.join(ROOT, 'data/status.json'), 'w') as f:
-                    json.dump({"last_log": status_msg}, f)
+            # 6. 信号触发
+            if res['signal']:
+                logging.info(f"SIGNAL FOUND: {res['signal']} @ {res['entry_price']}")
+                
+                # AI 过滤
+                allow = True
+                if config['strategy']['use_ai_filter']:
+                    ai = AIGuardian(secrets['deepseek']['apiKey'])
+                    ai_res = ai.review(df, res['signal'])
+                    if not ai_res['approved']:
+                        allow = False
+                        logging.info(f"AI REJECTED: {ai_res['reason']}")
+                
+                if allow:
+                    # engine.execute_order(...)
+                    logging.info("执行开单逻辑 (Simulation Mode)")
+
+            time.sleep(config['system']['check_interval'])
 
         except Exception as e:
-            print(f"❌ 错误: {e}")
-        
-        time.sleep(config['system']['check_interval'])
+            print(f"Main Loop Error: {e}")
+            logging.error(f"Error: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
