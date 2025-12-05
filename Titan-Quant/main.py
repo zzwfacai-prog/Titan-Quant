@@ -1,88 +1,74 @@
-import json
 import time
-import threading
+import json
 import os
-from datetime import datetime
 from core.data_engine import DataEngine
 from core.strategy_engine import StrategyEngine
-from core.execution_engine import ExecutionEngine
+from core.ai_guardian import AIGuardian
+from core.storage import Storage
+from core.notifier import Notifier
 
-def load_config():
-    with open(f'{os.path.dirname(__file__)}/config/exchanges.json') as f: ex_conf = json.load(f)
-    with open(f'{os.path.dirname(__file__)}/config/pairs.json') as f: pair_conf = json.load(f)
-    return ex_conf, pair_conf
+ROOT = os.path.dirname(os.path.abspath(__file__))
 
-def bot_loop(account_name, exchange_conf, pair_conf):
-    print(f"🔥 线程启动: {account_name} | 策略: v5.5 High-Freq")
+def load_json(path):
+    with open(path, 'r') as f: return json.load(f)
+
+def main():
+    print("🚀 Titan-Quant Ultra (AI-Agent) 启动中...")
     
-    data_eng = DataEngine(exchange_conf)
-    exec_eng = ExecutionEngine(data_eng.exchange, pair_conf['symbol'], 
-                               leverage=pair_conf['leverage'], 
-                               risk_per_trade=pair_conf['risk_per_trade'])
+    config = load_json(os.path.join(ROOT, 'config/config.json'))
+    secrets = load_json(os.path.join(ROOT, 'config/secrets.json'))
     
+    storage = Storage(os.path.join(ROOT, 'data/titan.db'))
+    notifier = Notifier(config['system']['webhook_url'])
+    
+    ai_agent = None
+    if config['strategy']['use_ai_filter']:
+        ai_agent = AIGuardian(secrets['deepseek']['apiKey'], secrets['deepseek']['model'])
+        print("🤖 DeepSeek 风险官已就位")
+
+    engines = {}
+    for name, ex_conf in config['exchanges'].items():
+        engines[name] = DataEngine(name, ex_conf, secrets['exchanges'][name])
+
     while True:
         try:
-            # 动态重新加载配置 (支持前端热修参数)
-            with open(f'{os.path.dirname(__file__)}/config/pairs.json') as f: 
-                current_conf = json.load(f)
-            
-            if not current_conf.get('is_running', False):
-                print(f"💤 {account_name}: 等待启动指令...")
-                time.sleep(10)
+            config = load_json(os.path.join(ROOT, 'config/config.json'))
+            if not config['system']['is_running']:
+                time.sleep(5)
                 continue
 
-            # 1. 同步持仓状态
-            exec_eng.sync_position()
-            
-            # 如果有持仓，跳过分析 (v5.5 规则: 不加仓，死拿)
-            if exec_eng.position_state['status'] != 'idle':
-                print(f"🔒 {account_name} 持仓中，跳过信号扫描...")
-                time.sleep(60)
-                continue
+            for name, engine in engines.items():
+                symbol = config['exchanges'][name]['symbol']
+                df = engine.fetch_ohlcv(symbol, config['strategy']['timeframe'])
+                if df is None: continue
+                
+                tech_res = StrategyEngine.analyze(df, config['strategy'])
+                status_msg = f"[{name}] 扫描: {tech_res['reason']}"
+                
+                if tech_res['signal']:
+                    print(f"🔔 {name} 技术信号: {tech_res['signal']}")
+                    
+                    if ai_agent:
+                        print("🤖 AI 正在审计...")
+                        ai_res = ai_agent.review_signal(df, tech_res)
+                        if ai_res['approved']:
+                            print(f"✅ AI 通过! 评分: {ai_res['score']}")
+                            notifier.send(f"开单 ({name})", f"AI评分: {ai_res['score']}\n{ai_res['reason']}")
+                            storage.log_trade(name, symbol, tech_res['signal'], tech_res['entry_price'], 0, ai_res['reason'], ai_res['score'])
+                        else:
+                            print(f"🛑 AI 驳回: {ai_res['reason']}")
+                            status_msg = f"AI 驳回: {ai_res['reason']}"
+                    else:
+                        print("✅ 无AI模式，执行开单")
+                        storage.log_trade(name, symbol, tech_res['signal'], tech_res['entry_price'], 0, tech_res['reason'])
 
-            # 2. 获取数据
-            df = data_eng.fetch_ohlcv(current_conf['symbol'], current_conf['timeframe'])
-            df = data_eng.add_indicators(df)
-            
-            if df is None:
-                time.sleep(10)
-                continue
-
-            # 3. 计算信号
-            result = StrategyEngine.v5_5_high_freq(df, current_conf)
-            
-            # 4. 输出状态日志
-            status = {
-                "time": str(datetime.now()),
-                "price": result['entry_price'],
-                "adx": df.iloc[-2]['adx'],
-                "signal": result['signal'],
-                "reason": result['reason']
-            }
-            with open(f'{os.path.dirname(__file__)}/logs/status.json', 'w') as f:
-                json.dump(status, f)
-
-            # 5. 执行
-            if result['signal']:
-                print(f"🔔 信号触发: {result['signal']} | 原因: {result['reason']}")
-                exec_eng.execute_signal(result)
-            else:
-                print(f"Scan: 无信号 (ADX={df.iloc[-2]['adx']:.1f})")
-
-            time.sleep(60) # 每分钟检查一次
+                with open(os.path.join(ROOT, 'data/status.json'), 'w') as f:
+                    json.dump({"last_log": status_msg}, f)
 
         except Exception as e:
-            print(f"❌ 错误 {account_name}: {e}")
-            time.sleep(10)
+            print(f"❌ 错误: {e}")
+        
+        time.sleep(config['system']['check_interval'])
 
 if __name__ == "__main__":
-    ex_configs, pair_configs = load_config()
-    
-    threads = []
-    for name, conf in ex_configs.items():
-        t = threading.Thread(target=bot_loop, args=(name, conf, pair_configs))
-        t.start()
-        threads.append(t)
-        
-    for t in threads:
-        t.join()
+    main()

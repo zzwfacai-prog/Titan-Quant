@@ -1,34 +1,48 @@
 import ccxt
 import pandas as pd
 import pandas_ta as ta
+import requests
 
 class DataEngine:
-    def __init__(self, exchange_config):
-        self.exchange_id = exchange_config['exchange']
-        exchange_class = getattr(ccxt, self.exchange_id)
-        self.exchange = exchange_class(exchange_config)
-    
-    def fetch_ohlcv(self, symbol, timeframe, limit=100):
-        try:
-            bars = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-            df['time'] = pd.to_datetime(df['time'], unit='ms')
-            return df
-        except Exception as e:
-            print(f"[Data Error] {symbol}: {e}")
-            return None
+    def __init__(self, exchange_name, config, secrets):
+        self.name = exchange_name
+        self.type = config.get('type', 'ccxt')
+        
+        if self.type == 'ccxt':
+            ex_id = config.get('id', 'binanceusdm')
+            ex_class = getattr(ccxt, ex_id)
+            self.client = ex_class({
+                'apiKey': secrets.get('apiKey'),
+                'secret': secrets.get('secret'),
+                'enableRateLimit': True,
+                'options': {'defaultType': 'future'}
+            })
+        elif self.type == 'custom':
+            self.api_url = config.get('api_url')
+            self.api_key = secrets.get('apiKey')
 
-    def add_indicators(self, df):
-        if df is None: return None
+    def fetch_ohlcv(self, symbol, timeframe):
         try:
-            # v5.5 核心指标
-            df['adx'] = df.ta.adx(length=14)['ADX_14']
-            df['ema50'] = df.ta.ema(length=50)
-            macd = df.ta.macd(fast=12, slow=26, signal=9)
-            df['macd'] = macd['MACD_12_26_9']
-            df['macd_signal'] = macd['MACDs_12_26_9']
-            df['atr'] = df.ta.atr(length=14)
+            if self.type == 'ccxt':
+                bars = self.client.fetch_ohlcv(symbol, timeframe, limit=100)
+                df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+                df['time'] = pd.to_datetime(df['time'], unit='ms')
+            
+            elif self.type == 'custom':
+                # ASterdex 适配占位符
+                print(f"[{self.name}] Custom API logic needed")
+                return None
+
+            if not df.empty:
+                df['adx'] = df.ta.adx(length=14)['ADX_14']
+                df['ema50'] = df.ta.ema(length=50)
+                df['atr'] = df.ta.atr(length=14)
+                macd = df.ta.macd(fast=12, slow=26, signal=9)
+                df['macd'] = macd['MACD_12_26_9']
+                df['macd_signal'] = macd['MACDs_12_26_9']
+            
             return df
+
         except Exception as e:
-            print(f"[Indicator Error]: {e}")
+            print(f"[{self.name}] Data Error: {e}")
             return None
