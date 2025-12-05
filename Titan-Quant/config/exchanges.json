@@ -1,0 +1,11 @@
+{
+    "binance_01": {
+        "exchange": "binanceusdm",
+        "apiKey": "\u8bf7\u66ff\u6362\u4f60\u7684API_KEY",
+        "secret": "\u8bf7\u66ff\u6362\u4f60\u7684SECRET_KEY",
+        "enableRateLimit": true,
+        "options": {
+            "defaultType": "future"
+        }
+    }
+}

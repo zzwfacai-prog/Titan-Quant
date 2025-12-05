@@ -1,0 +1,11 @@
+{
+    "symbol": "BTC/USDT",
+    "timeframe": "1h",
+    "is_running": false,
+    "leverage": 20,
+    "risk_per_trade": 0.018,
+    "adx_threshold": 15,
+    "sl_atr_mult": 2.0,
+    "tp_atr_mult": 8.0,
+    "min_notional": 110
+}
